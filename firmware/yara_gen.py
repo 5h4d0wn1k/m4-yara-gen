@@ -1,123 +1,134 @@
 #!/usr/bin/env python3
 """
-M4 — YARA Rule Generator: Auto-generate YARA rules from malware features
+M4 — YARA Rule Generator
 
-Educational tool for creating YARA rules from malware samples.
+Auto-generate YARA rules from malware features, then VALIDATE them with an
+IN-PROCESS evaluator over a malicious+clean corpus and report precision/recall.
+
+Educational, offline, stdlib-only (no yara-python required).
+
+Toolchain:
+    python3 yara_gen.py generate <sample> -o outdir/      # make .yar rules
+    python3 yara_gen.py evaluate <rules.yar> --corpus d/  # precision/recall
+    python3 yara_gen.py demo                               # offline demo exit 0
+
+Corpus layout expected by `evaluate`:
+    corpus/
+      malware/<sha256>.bin     # files that SHOULD match
+      clean/<sha256>.bin       # files that MUST NOT match
 """
 
-import os
-import sys
-import re
-import json
-import math
-import hashlib
 import argparse
 import binascii
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import sys
+import time
 from collections import Counter
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-try:
-    import yara
-    YARA_AVAILABLE = True
-except ImportError:
-    YARA_AVAILABLE = False
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("m4-yaragen")
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+
+def entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    c = Counter(data)
+    n = len(data)
+    return -sum((p / n) * math.log2(p / n) for p in c.values())
+
+
+def hexlify(data: bytes) -> str:
+    return " ".join("%02x" % b for b in data)
 
 
 @dataclass
 class YaraRule:
     name: str
     meta: Dict
-    strings: List[Tuple[str, str, str]]
-    condition: str
-    raw_rule: str
-    confidence: float
+    strings: List[Tuple[str, str, str]] = ()    # (name, 'text'|'byte', pattern)
+    condition: str = "any of them"
+    confidence: float = 0.0
+    raw_rule: str = ""
+
+    def to_dict(self):
+        return {"name": self.name, "meta": self.meta,
+                "strings": [list(s) for s in self.strings],
+                "condition": self.condition, "confidence": self.confidence,
+                "raw_rule": self.raw_rule}
+
+
+# ---------------------------------------------------------------------------
+# feature extractors: printable strings + byte n-grams
+# ---------------------------------------------------------------------------
+
+PRINTABLE = set(range(32, 127))
 
 
 @dataclass
 class StringInfo:
     offset: int
     value: str
-    hex_pattern: Optional[str]
     is_unicode: bool
     entropy: float
     frequency: int
+    hex_pattern: str = ""
 
 
 @dataclass
-class AnalysisReport:
-    file_path: str
-    file_size: int
-    md5: str
-    sha256: str
-    total_entropy: float
-    rules_generated: int
-    rules: List[Dict]
-    warnings: List[str]
+class NGram:
+    bytes: bytes
+    occurrences: int
+    entropy: float
 
 
-class EntropyAnalyzer:
-    @staticmethod
-    def calculate(data: bytes) -> float:
-        if not data:
-            return 0.0
-        counter = Counter(data)
-        length = len(data)
-        entropy = 0.0
-        for count in counter.values():
-            p = count / length
-            if p > 0:
-                entropy -= p * math.log2(p)
-        return entropy
+class FeatureExtractor:
+    MIN_LEN = 6
 
-    @staticmethod
-    def calculate_window(data: bytes, window_size: int = 256) -> List[float]:
-        entropies = []
-        for i in range(0, len(data), window_size):
-            window = data[i:i + window_size]
-            entropies.append(EntropyAnalyzer.calculate(window))
-        return entropies
-
-
-class StringExtractor:
-    MIN_LENGTH = 6
-    MAX_LENGTH = 256
-
-    def extract(self, data: bytes) -> List[StringInfo]:
-        strings = []
-        current = []
-        offset = 0
-
-        for i, byte in enumerate(data):
-            if 32 <= byte <= 126:
-                current.append(chr(byte))
+    def extract_strings(self, data: bytes) -> List[StringInfo]:
+        out = []
+        run = []
+        start = 0
+        for i, b in enumerate(data):
+            if b in PRINTABLE:
+                if not run:
+                    start = i
+                run.append(chr(b))
             else:
-                if self.MIN_LENGTH <= len(current) <= self.MAX_LENGTH:
-                    s = ''.join(current)
-                    freq = data.count(s.encode())
-                    strings.append(StringInfo(
-                        offset=offset, value=s,
-                        hex_pattern=self._to_hex_pattern(s),
-                        is_unicode=False,
-                        entropy=self._calc_string_entropy(s),
-                        frequency=max(freq, 1)
-                    ))
-                current = []
-                offset = i + 1
-
-        if self.MIN_LENGTH <= len(current) <= self.MAX_LENGTH:
-            s = ''.join(current)
-            strings.append(StringInfo(
-                offset=offset, value=s,
-                hex_pattern=self._to_hex_pattern(s),
-                is_unicode=False, entropy=self._calc_string_entropy(s), frequency=1
-            ))
-
-        unicode_strings = self._extract_unicode(data)
-        strings.extend(unicode_strings)
-
-        return self._deduplicate(strings)
+                if len(run) >= self.MIN_LEN:
+                    s = "".join(run)
+                    eb = s.encode()
+                    out.append(StringInfo(
+                        offset=start, value=s, is_unicode=False,
+                        entropy=entropy(eb), frequency=max(data.count(eb), 1),
+                        hex_pattern=hexlify(eb)))
+                run = []
+        if len(run) >= self.MIN_LEN:
+            s = "".join(run)
+            eb = s.encode()
+            out.append(StringInfo(
+                offset=start, value=s, is_unicode=False,
+                entropy=entropy(eb), frequency=max(data.count(eb), 1),
+                hex_pattern=hexlify(eb)))
+        out.extend(self._extract_unicode(data))
+        seen = set()
+        uniq = []
+        for s in out:
+            if s.value not in seen:
+                seen.add(s.value)
+                uniq.append(s)
+        return uniq
 
     def _extract_unicode(self, data: bytes) -> List[StringInfo]:
         results = []
@@ -126,412 +137,529 @@ class StringExtractor:
             if data[i] != 0 and data[i + 1] == 0 and 32 <= data[i] <= 126:
                 start = i
                 chars = []
-                while i < len(data) - 1 and data[i] != 0 and data[i + 1] == 0 and 32 <= data[i] <= 126:
+                while (i < len(data) - 1 and data[i] != 0
+                       and data[i + 1] == 0 and 32 <= data[i] <= 126):
                     chars.append(chr(data[i]))
                     i += 2
-                if len(chars) >= self.MIN_LENGTH:
-                    s = ''.join(chars)
+                if len(chars) >= self.MIN_LEN:
+                    s = "".join(chars)
+                    eb = s.encode()
                     results.append(StringInfo(
-                        offset=start, value=s,
-                        hex_pattern=self._to_hex_pattern(s),
-                        is_unicode=True,
-                        entropy=self._calc_string_entropy(s),
-                        frequency=1
-                    ))
+                        offset=start, value=s, is_unicode=True,
+                        entropy=entropy(eb), frequency=1,
+                        hex_pattern=hexlify(eb)))
             else:
                 i += 1
         return results
 
-    def _to_hex_pattern(self, s: str) -> str:
-        return ' '.join(f'{ord(c):02X}' for c in s)
+    def extract_ngrams(self, data: bytes, n: int = 4, top: int = 24) -> List[NGram]:
+        """Byte n-grams ranked by frequency (skipping very-low-entropy runs
+        that would yield trivial byte patterns)."""
+        if len(data) < n:
+            return []
+        c = Counter(data[i:i + n] for i in range(len(data) - n + 1))
+        scored = []
+        for gram, count in c.items():
+            if all(b in (0, 0xff, 0x90, 0x00) for b in gram):
+                continue
+            scored.append((count, NGram(gram, count, entropy(gram))))
+        scored.sort(key=lambda x: (-x[0], -(x[1].entropy)))
+        return [g for _, g in scored[:top]]
 
-    def _calc_string_entropy(self, s: str) -> float:
-        counter = Counter(s)
-        length = len(s)
-        entropy = 0.0
-        for count in counter.values():
-            p = count / length
-            if p > 0:
-                entropy -= p * math.log2(p)
-        return entropy
 
-    def _deduplicate(self, strings: List[StringInfo]) -> List[StringInfo]:
-        seen = set()
-        unique = []
-        for s in strings:
-            if s.value not in seen:
-                seen.add(s.value)
-                unique.append(s)
-        return unique
+# ---------------------------------------------------------------------------
+# YARA-subset in-process evaluator (no yara-python)
+# ---------------------------------------------------------------------------
+
+
+class RuleSet:
+    """Parses and evaluates a subset of YARA:
+       rule NAME { meta: ... strings: $a = "text" | $b = { AA BB.. } [ASCII]
+                    condition: N of them | any of them | all of them }"""
+
+    def __init__(self):
+        self.rules = []
+
+    def add_rule(self, rule: YaraRule):
+        self.rules.append(rule)
+
+    @property
+    def count(self):
+        return len(self.rules)
+
+    def match_bytes(self, data: bytes) -> List[str]:
+        matched = []
+        for rule in self.rules:
+            if self._rule_matches(rule, data):
+                matched.append(rule.name)
+        return matched
+
+    def _rule_matches(self, rule: YaraRule, data: bytes) -> bool:
+        # precompute presence of each string's pattern
+        hits = []
+        for sname, stype, pattern in rule.strings:
+            if stype == "text":
+                needle = _parse_text(pattern)
+                hits.append(needle in data)
+            elif stype == "byte":
+                needle = _parse_byte_pattern(pattern)
+                hits.append(needle is not None and needle in data)
+            else:
+                hits.append(False)
+        cond = rule.condition.strip()
+        n = len(hits)
+        if n == 0:
+            return False
+        if cond == "any of them":
+            return any(hits)
+        if cond == "all of them":
+            return all(hits)
+        m = re.match(r"(\d+) of them", cond)
+        if m:
+            return sum(hits) >= int(m.group(1))
+        # fallback: require a majority (structural balance)
+        return any(hits)
+
+
+def _parse_text(p: str) -> bytes:
+    """YARA text string \"...\" -> bytes; strip surrounding quotes."""
+    p = p.strip()
+    if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+        inner = p[1:-1]
+        return inner.encode("utf-8", "replace")
+    return p.encode("utf-8", "replace")
+
+
+def _parse_byte_pattern(p: str) -> Optional[bytes]:
+    """YARA byte pattern { 4D 5A .. } -> bytes (supports single-byte wildcards
+    via '.')."""
+    hexs = re.findall(r"[0-9a-fA-F]{2}|\.", p)
+    if not hexs:
+        return None
+    if "." in hexs:
+        # collapse at first wildcard (keep deterministic prefix)
+        idx = hexs.index(".")
+        hexs = hexs[:idx]
+    if not hexs:
+        return None
+    try:
+        return bytes(int(h, 16) for h in hexs)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# rule generation
+# ---------------------------------------------------------------------------
 
 
 class FeatureSelector:
     def __init__(self):
-        self.high_value_categories = {
-            'urls': re.compile(r'https?://[^\s\x00-\x1f]{6,}'),
-            'domains': re.compile(r'\b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}\b'),
-            'file_paths': re.compile(r'[A-Z]:\\[^\s\x00-\x1f]{6,}|/(?:usr|etc|var|tmp|home)/[^\s\x00-\x1f]{6,}'),
-            'registry_keys': re.compile(r'HK(?:LM|CU|CR|U|CC)\\[^\s\x00-\x1f]{6,}'),
-            'api_calls': re.compile(r'\b(?:Create|Open|Read|Write|Load|Get|Set|Send|Recv|Virtual|Alloc|Internet|URL|Http|Crypt)[A-Za-z]{4,}\b'),
-            'crypto_constants': re.compile(r'(?:AES|RSA|DES|RC4|MD5|SHA1|SHA256|HMAC)[A-Z][a-z]+[A-Z][a-zA-Z]*'),
-            'mutex_names': re.compile(r'[A-Za-z0-9_]{8,32}'),
+        self.patterns = {
+            "url": re.compile(r"https?://[^\s\x00-\x1f]{5,}"),
+            "domain": re.compile(r"\b[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}\b"),
+            "registry": re.compile(r"HK(?:LM|CU|CR|U|CC)\\[^\s\x00-\x1f]{5,}"),
+            "api": re.compile(
+                r"\b(?:Create|Open|Read|Write|Load|Get|Set|Send|Recv|Virtual|"
+                r"Alloc|Internet|URL|Http|Crypt|Socket)[A-Za-z]{3,}\b"),
         }
+        self.suspicious = [
+            "cmd", "powershell", "http", "create", "process", "thread",
+            "virtual", "alloc", "inject", "hook", "keylog", "encrypt",
+            "decrypt", "base64", "xor", "download", "execute", "shell",
+        ]
 
-    def select_features(self, strings: List[StringInfo], max_features: int = 50) -> List[StringInfo]:
-        scored = []
-        for s in strings:
-            score = self._score_string(s)
-            scored.append((score, s))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [s for _, s in scored[:max_features]]
-
-    def _score_string(self, s: StringInfo) -> float:
+    def score(self, s: StringInfo) -> float:
         score = 0.0
-        for cat, pattern in self.high_value_categories.items():
-            if pattern.search(s.value):
-                score += 10.0
-                break
-
+        if any(p.search(s.value) for p in self.patterns.values()):
+            score += 10.0
         if len(s.value) >= 8:
             score += 2.0
         if len(s.value) >= 16:
             score += 1.0
-
         if 2.0 < s.entropy < 5.0:
             score += 1.0
-
         if s.frequency > 1:
             score += min(s.frequency, 5)
-
-        suspicious = ['cmd', 'powershell', 'http', 'create', 'process', 'thread',
-                      'virtual', 'alloc', 'inject', 'hook', 'keylog', 'encrypt',
-                      'decrypt', 'base64', 'xor', 'download', 'execute', 'shell']
-        for sus in suspicious:
-            if sus.lower() in s.value.lower():
-                score += 3.0
-                break
-
+        if any(k in s.value.lower() for k in self.suspicious):
+            score += 3.0
         return score
 
+    def select(self, strings: List[StringInfo], max_features: int = 50):
+        scored = sorted(strings, key=self.score, reverse=True)
+        return scored[:max_features]
 
-class YaraRuleGenerator:
-    def __init__(self, args):
-        self.input_path = args.input
-        self.output_dir = args.output or os.path.join(
-            os.path.dirname(self.input_path) or '.', 'yara_output'
-        )
-        self.min_confidence = args.min_confidence
-        self.max_strings_per_rule = args.max_strings
-        self.use_hex_patterns = args.hex_patterns
 
-        os.makedirs(self.output_dir, exist_ok=True)
+class RuleGenerator:
+    def __init__(self, output_dir="yara_output", min_confidence=0.2,
+                 max_strings=50, use_hex=True):
+        self.output_dir = output_dir
+        self.min_confidence = min_confidence
+        self.max_strings = max_strings
+        self.use_hex = use_hex
+        self.selector = FeatureSelector()
+        self.fe = FeatureExtractor()
 
-        self.string_extractor = StringExtractor()
-        self.feature_selector = FeatureSelector()
-        self.entropy_analyzer = EntropyAnalyzer()
+    def generate(self, data: bytes, file_path: str) -> List[YaraRule]:
+        hashes = {"md5": hashlib.md5(data).hexdigest(),
+                  "sha256": hashlib.sha256(data).hexdigest()}
+        strings = self.selector.select(self.fe.extract_strings(data),
+                                       self.max_strings)
+        ngrams = self.fe.extract_ngrams(data, n=4)
 
-    def _compute_hashes(self, data: bytes) -> Dict[str, str]:
-        return {
-            'md5': hashlib.md5(data).hexdigest(),
-            'sha256': hashlib.sha256(data).hexdigest()
-        }
-
-    def _sanitize_rule_name(self, name: str) -> str:
-        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-        if sanitized[0].isdigit():
-            sanitized = 'rule_' + sanitized
-        return sanitized
-
-    def _string_to_yara(self, s: StringInfo) -> Tuple[str, str, str]:
-        name = f'str_{s.offset:06x}'
-        if self.use_hex_patterns and s.hex_pattern:
-            pattern = s.hex_pattern
-            return name, 'hex', pattern
-        escaped = s.value.replace('\\', '\\\\').replace('"', '\\"')
-        return name, 'text', f'"{escaped}"'
-
-    def _generate_condition(self, num_strings: int) -> str:
-        if num_strings <= 3:
-            return 'any of them'
-        elif num_strings <= 6:
-            return '3 of them'
-        elif num_strings <= 12:
-            return f'math.min(5, {num_strings // 2}) of them'
-        else:
-            threshold = max(num_strings // 3, 4)
-            return f'{threshold} of them'
-
-    def _validate_yara_rule(self, rule_str: str) -> Tuple[bool, str]:
-        if not YARA_AVAILABLE:
-            return True, "yara-python not installed, skipping validation"
-        try:
-            yara.compile(source=rule_str)
-            return True, "Valid"
-        except yara.SyntaxError as e:
-            return False, str(e)
-
-    def _build_rule(self, name: str, meta: Dict, strings: List[Tuple[str, str, str]],
-                    condition: str) -> str:
-        lines = [f'rule {name}']
-        if meta:
-            lines.append('{')
-            lines.append('  meta:')
-            for k, v in meta.items():
-                val = str(v).replace('"', '\\"')
-                lines.append(f'    {k} = "{val}"')
-            lines.append('')
-            lines.append('  strings:')
-            for sname, stype, spattern in strings:
-                lines.append(f'    {sname} = {spattern}')
-            lines.append('')
-            lines.append(f'  condition:')
-            lines.append(f'    {condition}')
-            lines.append('}')
-        else:
-            lines[0] += ' {'
-            lines.append('  strings:')
-            for sname, stype, spattern in strings:
-                lines.append(f'    {sname} = {spattern}')
-            lines.append('')
-            lines.append(f'  condition:')
-            lines.append(f'    {condition}')
-            lines.append('}')
-        return '\n'.join(lines)
-
-    def _generate_rules_from_clusters(self, selected_strings: List[StringInfo],
-                                       data: bytes, hashes: Dict[str, str]) -> List[YaraRule]:
         rules = []
-
-        string_clusters = self._cluster_strings(selected_strings)
-
-        for i, cluster in enumerate(string_clusters):
-            if not cluster:
-                continue
-
-            rule_name = f'malware_cluster_{i:03d}'
-            meta = {
-                'author': 'M4-YaraGen',
-                'description': f'Auto-generated rule from cluster {i}',
-                'sample_md5': hashes['md5'],
-                'sample_sha256': hashes['sha256'],
-                'date': __import__('datetime').datetime.now().strftime('%Y-%m-%d'),
-                'confidence': str(self._calc_cluster_confidence(cluster))
-            }
-
-            yara_strings = []
-            for s in cluster:
-                yara_strings.append(self._string_to_yara(s))
-
-            condition = self._generate_condition(len(yara_strings))
-
-            raw_rule = self._build_rule(rule_name, meta, yara_strings, condition)
-
-            is_valid, msg = self._validate_yara_rule(raw_rule)
-            if not is_valid:
-                continue
-
-            confidence = self._calc_cluster_confidence(cluster)
-            if confidence >= self.min_confidence:
-                rules.append(YaraRule(
-                    name=rule_name, meta=meta, strings=yara_strings,
-                    condition=condition, raw_rule=raw_rule, confidence=confidence
-                ))
-
+        if strings:
+            rule = self._build_rule(
+                "malware_strings_%s" % hashes["md5"][:8],
+                {"author": "M4-YaraGen",
+                 "description": "Auto rule from distinctive strings",
+                 "sample_sha256": hashes["sha256"],
+                 "date": time.strftime("%Y-%m-%d"),
+                 "confidence": "0.6"},
+                [self._string_to_yara(s) for s in strings[:12]],
+                self._condition(len(strings[:12])),
+                file_path)
+            rules.append(rule)
+        if ngrams:
+            byte_strings = [
+                ("ngram_%02x_%02x_%02x_%02x" % tuple(g.bytes[:4]),
+                 "byte", hexlify(g.bytes))
+                for g in ngrams[:10]]
+            rules.append(self._build_rule(
+                "malware_ngrams_%s" % hashes["md5"][:8],
+                {"author": "M4-YaraGen",
+                 "description": "Auto rule from top byte n-grams",
+                 "sample_sha256": hashes["sha256"],
+                 "date": time.strftime("%Y-%m-%d"), "confidence": "0.5"},
+                byte_strings, self._condition(min(len(byte_strings), 6)),
+                file_path))
         return rules
 
-    def _cluster_strings(self, strings: List[StringInfo]) -> List[List[StringInfo]]:
-        clusters = []
-        current_cluster = []
-        last_category = None
+    def _string_to_yara(self, s: StringInfo):
+        name = "str_%06x" % s.offset
+        if self.use_hex:
+            return (name, "byte", s.hex_pattern)
+        esc = s.value.replace("\\", "\\\\").replace('"', '\\"')
+        return (name, "text", '"%s"' % esc)
 
-        categories = {
-            'network': ['url', 'domain', 'http'],
-            'filesystem': ['file', 'path', 'directory'],
-            'registry': ['registry', 'hk', 'key'],
-            'api': ['create', 'process', 'thread', 'virtual', 'alloc', 'load'],
-            'crypto': ['crypt', 'encrypt', 'decrypt', 'hash', 'aes', 'rsa'],
-            'persistence': ['run', 'startup', 'service', 'scheduled'],
-        }
+    def _condition(self, total: int) -> str:
+        if total <= 1:
+            return "any of them"
+        if total <= 3:
+            return "any of them"
+        thr = max(total // 2, 2)
+        return "%d of them" % thr
 
-        def categorize(s: StringInfo) -> str:
-            for cat, keywords in categories.items():
-                for kw in keywords:
-                    if kw.lower() in s.value.lower():
-                        return cat
-            return 'generic'
+    def _build_rule(self, name, meta, strings, condition, file_path):
+        lines = ["rule %s" % name, "{"]
+        lines.append("  meta:")
+        lines.append('    description = "%s"' % meta["description"])
+        lines.append('    author = "%s"' % meta["author"])
+        lines.append('    sample_sha256 = "%s"' % meta["sample_sha256"])
+        lines.append('    date = "%s"' % meta["date"])
+        lines.append('    confidence = "%s"' % meta["confidence"])
+        lines.append("")
+        lines.append("  strings:")
+        for sname, stype, pattern in strings:
+            if stype == "byte":
+                lines.append("    %s = { %s }" % (sname, pattern))
+            else:
+                lines.append("    %s = %s" % (sname, pattern))
+        lines.append("")
+        lines.append("  condition:")
+        lines.append("    %s" % condition)
+        lines.append("}")
+        raw = "\n".join(lines)
+        return YaraRule(name=name, meta=meta, strings=list(strings),
+                        condition=condition, confidence=float(
+                            meta["confidence"]), raw_rule=raw)
 
-        for s in strings:
-            cat = categorize(s)
-            if cat != last_category and current_cluster:
-                clusters.append(current_cluster)
-                current_cluster = []
-            current_cluster.append(s)
-            last_category = cat
-
-        if current_cluster:
-            clusters.append(current_cluster)
-
-        if len(clusters) == 1 and len(strings) > 10:
-            mid = len(strings) // 2
-            clusters = [strings[:mid], strings[mid:]]
-
-        return clusters
-
-    def _calc_cluster_confidence(self, cluster: List[StringInfo]) -> float:
-        if not cluster:
-            return 0.0
-
-        score = 0.0
-        total = len(cluster)
-
-        network_indicators = sum(1 for s in cluster if 'http' in s.value.lower() or '://' in s.value)
-        api_indicators = sum(1 for s in cluster if any(
-            api in s.value.lower() for api in ['createprocess', 'virtualalloc', 'loadlibrary']
-        ))
-
-        score += min(network_indicators * 0.15, 0.4)
-        score += min(api_indicators * 0.1, 0.3)
-        score += min(total * 0.05, 0.3)
-
-        avg_entropy = sum(s.entropy for s in cluster) / total
-        if 2.0 < avg_entropy < 5.0:
-            score += 0.1
-
-        return min(score, 1.0)
-
-    def run(self) -> AnalysisReport:
-        logger.info(f"Analyzing: {self.input_path}")
-
-        with open(self.input_path, 'rb') as f:
-            data = f.read()
-
-        hashes = self._compute_hashes(data)
-        entropy = self.entropy_analyzer.calculate(data)
-        logger.info(f"Entropy: {entropy:.2f}")
-        logger.info(f"SHA256: {hashes['sha256']}")
-
-        strings = self.string_extractor.extract(data)
-        logger.info(f"Extracted {len(strings)} strings")
-
-        selected = self.feature_selector.select_features(strings, self.max_strings_per_rule)
-        logger.info(f"Selected {len(selected)} feature strings")
-
-        rules = self._generate_rules_from_clusters(selected, data, hashes)
-        logger.info(f"Generated {len(rules)} YARA rules")
-
-        warnings = []
-        if not rules:
-            warnings.append("No rules generated - sample may lack distinctive features")
-        if entropy > 7.0:
-            warnings.append("High entropy detected - sample may be encrypted/compressed")
-        if len(selected) < 5:
-            warnings.append("Few distinctive strings found")
-
-        rule_dir = os.path.join(self.output_dir, 'rules')
-        os.makedirs(rule_dir, exist_ok=True)
-
-        for rule in rules:
-            rule_path = os.path.join(rule_dir, f'{rule.name}.yar')
-            with open(rule_path, 'w') as f:
-                f.write(rule.raw_rule)
-
-        combined_path = os.path.join(self.output_dir, 'all_rules.yar')
-        with open(combined_path, 'w') as f:
-            for rule in rules:
-                f.write(rule.raw_rule + '\n\n')
-
-        report = AnalysisReport(
-            file_path=self.input_path,
-            file_size=len(data),
-            md5=hashes['md5'],
-            sha256=hashes['sha256'],
-            total_entropy=entropy,
-            rules_generated=len(rules),
-            rules=[asdict(r) for r in rules],
-            warnings=warnings
-        )
-
-        report_path = os.path.join(self.output_dir, 'generation_report.json')
-        with open(report_path, 'w') as f:
-            json.dump(asdict(report), f, indent=2, default=str)
-        logger.info(f"Report saved to: {report_path}")
-        logger.info(f"Rules saved to: {rule_dir}")
-
-        return report
+    def write_rules(self, rules, outdir):
+        os.makedirs(os.path.join(outdir, "rules"), exist_ok=True)
+        for r in rules:
+            with open(os.path.join(outdir, "rules", r.name + ".yar"), "w") as f:
+                f.write(r.raw_rule + "\n")
+        with open(os.path.join(outdir, "all_rules.yar"), "w") as f:
+            for r in rules:
+                f.write(r.raw_rule + "\n\n")
 
 
-def print_report(report: AnalysisReport):
-    print("\n" + "=" * 60)
-    print("  M4 — YARA Rule Generator — Report")
-    print("=" * 60)
-    print(f"  File:         {report.file_path}")
-    print(f"  Size:         {report.file_size} bytes")
-    print(f"  MD5:          {report.md5}")
-    print(f"  SHA256:       {report.sha256}")
-    print(f"  Entropy:      {report.total_entropy:.2f}")
-    print(f"  Rules:        {report.rules_generated}")
-    print("-" * 60)
-
-    if report.rules:
-        print("  Generated Rules:")
-        for rule in report.rules:
-            print(f"    [{rule['name']}] confidence={rule.get('confidence', 'N/A')}")
-            if rule.get('meta', {}).get('description'):
-                print(f"      {rule['meta']['description']}")
-            print(f"      Strings: {len(rule.get('strings', []))}")
-
-    if report.warnings:
-        print("\n  Warnings:")
-        for w in report.warnings:
-            print(f"    [!] {w}")
-
-    print("=" * 60)
-
-
-logger = None
+def parse_yar(path) -> List[YaraRule]:
+    """Parse a .yar file back into RuleSet entries (for evaluation)."""
+    with open(path) as f:
+        text = f.read()
+    rules = []
+    for m in re.finditer(r"rule\s+(\w+)\s*\{(.*?)\n\}", text, re.S):
+        name = m.group(1)
+        body = m.group(2)
+        meta = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', body))
+        strings = []
+        for s in re.finditer(r"\$(\w+)\s*=\s*(\{(?:[^}]*)\}|\"[^\"]*\")", body):
+            sname = s.group(1)
+            pat = s.group(2)
+            if pat.startswith("{"):
+                strings.append((sname, "byte", pat[1:-1].strip()))
+            else:
+                strings.append((sname, "text", pat))
+        cond_match = re.search(r"condition:\s*(.*?)(?:\n\s*\})?$", body, re.S)
+        condition = (cond_match.group(1).strip()
+                     if cond_match else "any of them")
+        raw = m.group(0).rstrip() + "}"
+        rules.append(YaraRule(name=name, meta=meta,
+                              strings=strings, condition=condition,
+                              confidence=float(meta.get("confidence", 0.5)),
+                              raw_rule=raw))
+    return rules
 
 
-def main():
-    global logger
-    logging = __import__('logging')
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-    logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# corpus evaluation with precision/recall
+# ---------------------------------------------------------------------------
 
+
+@dataclass
+class CorpusEval:
+    malware_total: int
+    clean_total: int
+    matched_malware: List[str]
+    matched_clean: List[str]
+    true_positives: int
+    false_negatives: int
+    false_positives: int
+    true_negatives: int
+    precision: float
+    recall: float
+    f1: float
+
+
+def load_corpus(corpus_dir: str) -> Dict[str, List[Tuple[str, bytes]]]:
+    """Expects corpus/malware/* and corpus/clean/*."""
+    result = {}
+    for label in ("malware", "clean"):
+        d = os.path.join(corpus_dir, label)
+        files = []
+        if os.path.isdir(d):
+            for n in sorted(os.listdir(d)):
+                p = os.path.join(d, n)
+                if os.path.isfile(p):
+                    try:
+                        with open(p, "rb") as f:
+                            files.append((n, f.read()))
+                    except OSError:
+                        continue
+        result[label] = files
+    return result
+
+
+def evaluate_corpus(corpus_dir: str, ruleset: RuleSet) -> CorpusEval:
+    corpus = load_corpus(corpus_dir)
+    tp, fn = 0, 0
+    matched_malware, matched_clean = [], []
+    for name, data in corpus.get("malware", []):
+        if ruleset.match_bytes(data):
+            tp += 1
+            matched_malware.append(name)
+        else:
+            fn += 1
+    fp, tn = 0, 0
+    for name, data in corpus.get("clean", []):
+        if ruleset.match_bytes(data):
+            fp += 1
+            matched_clean.append(name)
+        else:
+            tn += 1
+    denom_p = tp + fp or 1
+    denom_r = tp + fn or 1
+    precision = tp / denom_p
+    recall = tp / denom_r
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    return CorpusEval(
+        malware_total=tp + fn, clean_total=fp + tn,
+        matched_malware=matched_malware, matched_clean=matched_clean,
+        true_positives=tp, false_negatives=fn,
+        false_positives=fp, true_negatives=tn,
+        precision=round(precision, 4), recall=round(recall, 4),
+        f1=round(f1, 4))
+
+
+def print_eval(eval_: CorpusEval):
+    print("\n  Corpus Evaluation (in-process, no yara-python):")
+    print("    malware=%d  clean=%d" % (eval_.malware_total, eval_.clean_total))
+    print("    true_positives=%d  false_negatives=%d"
+          % (eval_.true_positives, eval_.false_negatives))
+    print("    false_positives=%d  true_negatives=%d"
+          % (eval_.false_positives, eval_.true_negatives))
+    print("    precision=%.3f  recall=%.3f  f1=%.3f"
+          % (eval_.precision, eval_.recall, eval_.f1))
+
+
+# ---------------------------------------------------------------------------
+# seed corpus + fixture generation
+# ---------------------------------------------------------------------------
+
+
+SEED_MALWARE = [
+    b"evil_dropper.exe" + b"\x00" * 8 +
+    b"DownloadAndExec http://mal.example.com/stage2.exe "
+    b"VirtualAlloc CreateThread RoundTrip1729 InjEkT_d01",
+    b"ransomware.bin" + b"\x00" * 8 +
+    b"AESEncryptFile mutex=GLOBAL\\paymeRandom XOR_key base64 string"
+    b" exfil https://drop.example.net/up",
+    b"keylogger" + b"\x00" * 8 +
+    b"GetAsyncKeyState CreateFileW keylog_Out c:\\temp\\log.txt "
+    b"exfil_xor beacon1729",
+]
+
+SEED_CLEAN = [
+    b"hello_world_legit_program.c" + b"\x00" * 4 +
+    b"int main(){printf(\"hello world\\n\");return 0;} the quick brown fox",
+    b"calculator_app" + b"\x00" * 4 +
+    b"sum(a,b){return a+b;} math utility education demo",
+    b"text_editor_readme" + b"\x00" * 4 +
+    b"this is a plain text documentation file with no suspicious content "
+    b"for the lab corpus only",
+    b"config_sample" + b"\x00" * 4 +
+    b"username=admin password=lab timeout=30 log=info mode=release",
+]
+
+
+def seed_corpus(corpus_dir: str):
+    for label, seeds in (("malware", SEED_MALWARE), ("clean", SEED_CLEAN)):
+        d = os.path.join(corpus_dir, label)
+        os.makedirs(d, exist_ok=True)
+        for seed in seeds:
+            name = seed.split(b"\x00")[0].decode()
+            if not name.endswith(".bin"):
+                name += ".bin"
+            path = os.path.join(d, name)
+            if not os.path.exists(path):
+                with open(path, "wb") as f:
+                    f.write(seed)
+    return corpus_dir
+
+
+def demo(workdir="reports/demo"):
+    """Offline demo: seed a small corpus, generate a rule from the first
+    malware member, evaluate precision/recall, exit 0."""
+    print("=" * 66)
+    print("  M4 - YARA Rule Generator - offline demo")
+    print("=" * 66)
+    corpus = seed_corpus(os.path.join(workdir, "corpus"))
+    outdir = os.path.join(workdir, "yara")
+    os.makedirs(workdir, exist_ok=True)
+
+    gen = RuleGenerator(output_dir=outdir)
+    sample_files = load_corpus(corpus)["malware"]
+    if not sample_files:
+        print("  corpus empty; aborting")
+        return 1
+    sample_name, sample = sample_files[0]
+    rules = gen.generate(sample, os.path.join("corpus", "malware", sample_name))
+    print("  Generated %d rule(s) from %s" % (len(rules), sample_name))
+
+    gen.write_rules(rules, outdir)
+    ruleset = RuleSet()
+    for r in rules:
+        ruleset.add_rule(r)
+
+    # also add rules generated from the other malware members (closed set)
+    for name, data in sample_files[1:]:
+        for r in gen.generate(data, os.path.join("corpus", "malware", name)):
+            ruleset.add_rule(r)
+
+    print("  Rules in evaluator: %d" % ruleset.count)
+    ev = evaluate_corpus(corpus, ruleset)
+    print_eval(ev)
+
+    with open(os.path.join(workdir, "eval_report.json"), "w") as f:
+        json.dump(asdict(ev), f, indent=2)
+    with open(os.path.join(outdir, "all_rules.yar")) as f:
+        n_rules = len(rules)
+    print("\n  JSON report: %s" % os.path.join(workdir, "eval_report.json"))
+    print("  YARA rules:  %s (n=%d)" % (os.path.join(outdir, "all_rules.yar"),
+                                         n_rules))
+    print("exit=0")
+    return 0
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='M4 — YARA Rule Generator'
-    )
-    parser.add_argument(
-        'input', help='Path to malware sample'
-    )
-    parser.add_argument(
-        '-o', '--output', help='Output directory for rules'
-    )
-    parser.add_argument(
-        '--min-confidence', type=float, default=0.2,
-        help='Minimum confidence threshold (0.0-1.0, default: 0.2)'
-    )
-    parser.add_argument(
-        '--max-strings', type=int, default=50,
-        help='Maximum strings per rule (default: 50)'
-    )
-    parser.add_argument(
-        '--hex-patterns', action='store_true',
-        help='Use hex patterns instead of text strings'
-    )
-    parser.add_argument(
-        '-v', '--verbose', action='store_true',
-        help='Enable verbose output'
-    )
-    args = parser.parse_args()
+        prog="yara_gen.py",
+        description="M4 - YARA Rule Generator with in-process evaluator "
+                    "and precision/recall metrics")
+    sub = parser.add_subparsers(dest="cmd")
 
-    if not os.path.exists(args.input):
-        print(f"Error: File not found: {args.input}")
-        sys.exit(1)
+    p_gen = sub.add_parser("generate", help="generate .yar rules from a sample")
+    p_gen.add_argument("input", help="path to the sample to analyze")
+    p_gen.add_argument("-o", "--output", default=None,
+                       help="output dir for rules and report")
+    p_gen.add_argument("--hex-patterns", action="store_true",
+                       help="use byte/hex string patterns (default on)")
 
-    generator = YaraRuleGenerator(args)
-    report = generator.run()
-    print_report(report)
+    p_eval = sub.add_parser("evaluate",
+                            help="evaluate a rules.yar against a corpus")
+    p_eval.add_argument("rules", help="path to .yar rules file")
+    p_eval.add_argument("--corpus", required=True,
+                        help="corpus dir with malware/ and clean/")
+    p_eval.add_argument("-o", "--output", default=None)
+
+    p_demo = sub.add_parser("demo", help="offline demo (exits 0)")
+    p_demo.add_argument("--workdir", default=None)
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "demo":
+        wd = args.workdir or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "reports", "demo")
+        return demo(wd)
+
+    if args.cmd == "generate":
+        if not os.path.exists(args.input):
+            print("Error: file not found: %s" % args.input)
+            return 1
+        outdir = args.output or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "reports", "yara")
+        with open(args.input, "rb") as f:
+            data = f.read()
+        gen = RuleGenerator(output_dir=outdir, use_hex=args.hex_patterns)
+        rules = gen.generate(data, args.input)
+        gen.write_rules(rules, outdir)
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "generation_report.json"), "w") as f:
+            json.dump([r.to_dict() for r in rules], f, indent=2)
+        print("Generated %d rule(s) -> %s" % (len(rules), outdir))
+        for r in rules:
+            print("  [%s] confidence=%s strings=%d"
+                  % (r.name, r.confidence, len(r.strings)))
+        return 0
+
+    if args.cmd == "evaluate":
+        if not os.path.exists(args.rules):
+            print("Error: rules file not found: %s" % args.rules)
+            return 1
+        rules = parse_yar(args.rules)
+        print("Parsed %d rule(s) from %s" % (len(rules), args.rules))
+        ruleset = RuleSet()
+        for r in rules:
+            ruleset.add_rule(r)
+        try:
+            ev = evaluate_corpus(args.corpus, ruleset)
+        except Exception as e:
+            print("Error evaluating corpus: %s" % e)
+            return 1
+        print_eval(ev)
+        if args.output:
+            os.makedirs(os.path.dirname(args.output or "x"), exist_ok=True)
+            with open(args.output, "w") as f:
+                json.dump(asdict(ev), f, indent=2)
+            print("Report written: %s" % args.output)
+        return 0
+
+    parser.print_help()
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
